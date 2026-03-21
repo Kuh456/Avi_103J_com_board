@@ -459,36 +459,31 @@ async fn lora_task(mut uart: Uart<'static, Async>, mut aux_pin: Input<'static>) 
         }
     }
 }
-
 #[embassy_executor::task]
 async fn create_lora_payload() {
     loop {
-        let mut local_payload = { *PAYLOAD_MUTEX.lock().await };
-        let now = Instant::now();
-        let is_timeout = |last_seen: Option<Instant>| -> bool {
-            match last_seen {
-                Some(time) => now.duration_since(time).as_secs() > 80,
-                None => true, // まだ1度も受信していない場合も異常（初期状態）とみなす
-            }
-        };
-
-        if is_timeout(*LAST_SEEN_LOG.lock().await) {
-            local_payload.status &= 0b1111_0111; // ログ基板タイムアウト
-            IS_CAN_ERROR.store(true, Ordering::Relaxed);
-        }
-        if is_timeout(*LAST_SEEN_CAMERA.lock().await) {
-            local_payload.status &= 0b1110_1111; // カメラ基板タイムアウト
-            IS_CAN_ERROR.store(true, Ordering::Relaxed);
-        }
-        if is_timeout(*LAST_SEEN_POWER.lock().await) {
-            local_payload.status &= 0b1101_1111; // 電源基板タイムアウト
-            IS_CAN_ERROR.store(true, Ordering::Relaxed);
-        }
-        local_payload.update_checksum();
-
         {
-            let mut global_payload = PAYLOAD_MUTEX.lock().await;
-            *global_payload = local_payload;
+            let mut payload = PAYLOAD_MUTEX.lock().await;
+            let now = Instant::now();
+            let is_timeout = |last_seen: Option<Instant>| -> bool {
+                match last_seen {
+                    Some(time) => now.duration_since(time).as_secs() > 80,
+                    None => true, // まだ1度も受信していない場合も異常（初期状態）とみなす
+                }
+            };
+
+            // ② 直接グローバル変数を書き換える
+            if is_timeout(*LAST_SEEN_LOG.lock().await) {
+                payload.status &= 0b1111_0111; // ログ基板タイムアウト
+            }
+            if is_timeout(*LAST_SEEN_CAMERA.lock().await) {
+                payload.status &= 0b1110_1111; // カメラ基板タイムアウト
+            }
+            if is_timeout(*LAST_SEEN_POWER.lock().await) {
+                payload.status &= 0b1101_1111; // 電源基板タイムアウト
+            }
+
+            payload.update_checksum();
         }
         Timer::after(Duration::from_millis(100)).await;
     }
@@ -642,7 +637,6 @@ async fn sd_write_task(
     let _ = tlm_file.write(header);
     let mut last_flush = Instant::now();
     loop {
-        let flush_timer = Timer::after(Duration::from_secs(5));
         let has_data = raw_cursor > 0 || tlm_cursor > 0;
         HAS_UNFLUSHED_DATA.store(has_data, Ordering::Relaxed);
         let is_logging = IS_LOGGING.load(Ordering::Relaxed);
