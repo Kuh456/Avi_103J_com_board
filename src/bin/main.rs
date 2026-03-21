@@ -149,23 +149,18 @@ impl Payload {
     }
     /// 自身のデータ（ヘッダーから気圧まで）のチェックサムを計算する
     fn calculate_checksum(&self) -> u8 {
-        let size = core::mem::size_of::<Self>();
-
         // 構造体自身をバイトの配列(&[u8])」として強制的に読み替える
         let bytes: &[u8] = &self.to_bytes();
-        // let bytes: &[u8] =
-        //     unsafe { core::slice::from_raw_parts(self as *const Self as *const u8, size) };
-
         let mut sum: u8 = 0;
         // 最初の3バイトと最後の1バイト（check_sum自身）を除いた部分
-        for &byte in &bytes[3..size - 1] {
+        for &byte in &bytes[3..bytes.len() - 1] {
             sum ^= byte;
         }
         sum
     }
     /// ペイロードを安全にバイト配列に変換する
-    pub fn to_bytes(&self) -> [u8; 33] {
-        let mut buf = [0u8; 33];
+    pub fn to_bytes(&self) -> [u8; 29] {
+        let mut buf = [0u8; 29];
         let mut offset = 0;
 
         buf[offset] = self.add_h;
@@ -332,28 +327,37 @@ async fn can_receive_task(mut rx: twai::TwaiRx<'static, Async>) {
                         status_payload = (status_payload & 0b1011_1111) | 0b0100_0000;
                     }
                     Id::Standard(s_id) if s_id.as_raw() == CAN_ID_ANGLE_SPEED => {
-                        let mut angle_speed = [0u8; 6];
-                        angle_speed.copy_from_slice(&payload.data()[0..6]);
-                        let mut angle_speed_payload = PAYLOAD_MUTEX.lock().await.angle_speed;
-                        for (i, chunk) in angle_speed.chunks_exact(2).enumerate() {
-                            // chunk は [u8; 2] に変換（try_into）してから i16 にする
-                            angle_speed_payload[i] = i16::from_le_bytes(chunk.try_into().unwrap());
+                        if payload.data().len() >= 6 {
+                            let mut angle_speed = [0u8; 6];
+                            angle_speed.copy_from_slice(&payload.data()[0..6]);
+                            let mut angle_speed_payload = PAYLOAD_MUTEX.lock().await.angle_speed;
+                            for (i, chunk) in angle_speed.chunks_exact(2).enumerate() {
+                                // chunk は [u8; 2] に変換（try_into）してから i16 にする
+                                angle_speed_payload[i] =
+                                    i16::from_le_bytes(chunk.try_into().unwrap());
+                            }
                         }
                     }
                     Id::Standard(s_id) if s_id.as_raw() == CAN_ID_ACCELARATION => {
-                        let mut accelaration = [0u8; 6];
-                        accelaration.copy_from_slice(&payload.data()[0..6]);
-                        let mut accelaration_payload = PAYLOAD_MUTEX.lock().await.acceleration;
-                        for (i, chunk) in accelaration.chunks_exact(2).enumerate() {
-                            // chunk は [u8; 2] に変換（try_into）してから i16 にする
-                            accelaration_payload[i] = i16::from_le_bytes(chunk.try_into().unwrap());
+                        if payload.data().len() >= 6 {
+                            let mut accelaration = [0u8; 6];
+                            accelaration.copy_from_slice(&payload.data()[0..6]);
+                            let mut accelaration_payload = PAYLOAD_MUTEX.lock().await.acceleration;
+                            for (i, chunk) in accelaration.chunks_exact(2).enumerate() {
+                                // chunk は [u8; 2] に変換（try_into）してから i16 にする
+                                accelaration_payload[i] =
+                                    i16::from_le_bytes(chunk.try_into().unwrap());
+                            }
                         }
                     }
                     Id::Standard(s_id) if s_id.as_raw() == CAN_ID_AIR_PRESSURE => {
-                        let mut air_pressure = [0u8; 2];
-                        air_pressure.copy_from_slice(&payload.data()[0..2]);
-                        let mut air_pressure_payload = PAYLOAD_MUTEX.lock().await.air_pressure;
-                        air_pressure_payload = i16::from_le_bytes(air_pressure.try_into().unwrap());
+                        if payload.data().len() >= 2 {
+                            let mut air_pressure = [0u8; 2];
+                            air_pressure.copy_from_slice(&payload.data()[0..2]);
+                            let mut air_pressure_payload = PAYLOAD_MUTEX.lock().await.air_pressure;
+                            air_pressure_payload =
+                                i16::from_le_bytes(air_pressure.try_into().unwrap());
+                        }
                     }
                     Id::Standard(s_id) if s_id.as_raw() == CAN_ID_TOP => {
                         TRIGGER_SIGNAL.signal(true);
@@ -474,12 +478,15 @@ async fn create_lora_payload() {
 
         if is_timeout(*LAST_SEEN_LOG.lock().await) {
             local_payload.status &= 0b1111_0111; // ログ基板タイムアウト
+            IS_CAN_ERROR.store(true, Ordering::Relaxed);
         }
         if is_timeout(*LAST_SEEN_CAMERA.lock().await) {
             local_payload.status &= 0b1110_1111; // カメラ基板タイムアウト
+            IS_CAN_ERROR.store(true, Ordering::Relaxed);
         }
         if is_timeout(*LAST_SEEN_POWER.lock().await) {
             local_payload.status &= 0b1101_1111; // 電源基板タイムアウト
+            IS_CAN_ERROR.store(true, Ordering::Relaxed);
         }
         local_payload.update_checksum();
 
@@ -506,6 +513,13 @@ pub async fn gnss_manager_task(mut uart: Uart<'static, Async>, mut gnss_en: Outp
                     continue;
                 }
                 for &letter in &read_buf[..bytes_read] {
+                    if letter == b'$' {
+                        line_len = 0;
+                        line_buf[line_len] = letter;
+                        line_len += 1;
+                        continue;
+                    }
+
                     if letter == b'\r' {
                         continue;
                     }
@@ -527,8 +541,6 @@ pub async fn gnss_manager_task(mut uart: Uart<'static, Async>, mut gnss_en: Outp
                     if line_len < line_buf.len() {
                         line_buf[line_len] = letter;
                         line_len += 1;
-                    } else {
-                        line_len = 0;
                     }
                 }
             }
@@ -612,13 +624,13 @@ async fn sd_write_task(
     let mut raw_gnss_file = root_dir
         .open_file_in_dir(
             "GNSS_RAW.TXT",
-            embedded_sdmmc::Mode::ReadWriteCreateOrTruncate,
+            embedded_sdmmc::Mode::ReadWriteCreateOrAppend,
         )
         .unwrap();
     let mut tlm_file = root_dir
         .open_file_in_dir(
             "TELEMETRY.CSV",
-            embedded_sdmmc::Mode::ReadWriteCreateOrTruncate,
+            embedded_sdmmc::Mode::ReadWriteCreateOrAppend,
         )
         .unwrap();
     // CSVのヘッダー
