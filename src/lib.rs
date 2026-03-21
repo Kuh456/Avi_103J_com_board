@@ -298,21 +298,21 @@ pub const UART_BAUD: &[u8] = &[
     0x01, 0x00, 0x03, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0xBC, 0x5E,
 ]; // baud rate = 115200
 
-fn send_cmd(tx: &mut esp_hal::uart::Uart<'static, esp_hal::Blocking>, mut data: &[u8]) {
+async fn send_cmd(tx: &mut esp_hal::uart::UartTx<'static, esp_hal::Async>, mut data: &[u8]) {
     while !data.is_empty() {
-        let written = tx.write(data).unwrap();
+        let written = tx.write_async(data).await.unwrap();
         // 書き込めた分だけスライスの先頭を削って、残りを次のループで送る
         data = &data[written..];
     }
 }
-pub fn gnss_setting(gnss: &mut esp_hal::uart::Uart<'static, esp_hal::Blocking>) {
-    send_cmd(gnss, GGL_DELETE);
-    send_cmd(gnss, GSA_DELETE);
-    send_cmd(gnss, GSV_DELETE);
-    send_cmd(gnss, VTG_DELETE);
-    send_cmd(gnss, MEAS_RATE);
-    send_cmd(gnss, SLAS_EN);
-    send_cmd(gnss, DYNAMIC_MODEL_AIRBORNE_4G);
-    send_cmd(gnss, UART_BAUD);
-    gnss.flush().unwrap();
+pub async fn gnss_setting(tx: &mut esp_hal::uart::UartTx<'static, esp_hal::Async>) {
+    send_cmd(tx, GGL_DELETE).await;
+    send_cmd(tx, GSA_DELETE).await;
+    send_cmd(tx, GSV_DELETE).await;
+    send_cmd(tx, VTG_DELETE).await;
+    send_cmd(tx, MEAS_RATE).await;
+    send_cmd(tx, SLAS_EN).await;
+    send_cmd(tx, DYNAMIC_MODEL_AIRBORNE_4G).await;
+    send_cmd(tx, UART_BAUD).await;
+    tx.flush_async().await.unwrap();
 }
