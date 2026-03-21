@@ -298,14 +298,14 @@ pub const UART_BAUD: &[u8] = &[
     0x01, 0x00, 0x03, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0xBC, 0x5E,
 ]; // baud rate = 115200
 
-async fn send_cmd(tx: &mut esp_hal::uart::UartTx<'static, esp_hal::Async>, mut data: &[u8]) {
+async fn send_cmd(tx: &mut esp_hal::uart::Uart<'static, esp_hal::Async>, mut data: &[u8]) {
     while !data.is_empty() {
         let written = tx.write_async(data).await.unwrap();
         // 書き込めた分だけスライスの先頭を削って、残りを次のループで送る
         data = &data[written..];
     }
 }
-pub async fn gnss_setting(tx: &mut esp_hal::uart::UartTx<'static, esp_hal::Async>) {
+pub async fn gnss_setting(tx: &mut esp_hal::uart::Uart<'static, esp_hal::Async>) {
     send_cmd(tx, GGL_DELETE).await;
     send_cmd(tx, GSA_DELETE).await;
     send_cmd(tx, GSV_DELETE).await;

@@ -39,11 +39,9 @@ static TZ: jiff::tz::TimeZone = jiff::tz::get!("UTC");
 impl TimeSource for SdTimeSource {
     fn get_timestamp(&self) -> Timestamp {
         let now_us = self.current_time();
-
         // Convert to jiff Time
         let now = jiff::Timestamp::from_microsecond(now_us as i64).unwrap();
         let now = now.to_zoned(TZ.clone());
-
         Timestamp {
             year_since_1970: (now.year() - 1970).unsigned_abs() as u8,
             zero_indexed_month: now.month().wrapping_sub(1) as u8,
@@ -90,6 +88,7 @@ static IS_LOGGING: AtomicBool = AtomicBool::new(false);
 static HAS_UNFLUSHED_DATA: AtomicBool = AtomicBool::new(false);
 static CAN_TX_CHANNEL: Channel<CriticalSectionRawMutex, (u16, u8), 5> = Channel::new();
 static IS_CAN_ERROR: AtomicBool = AtomicBool::new(true);
+pub static GNSS_CMD_CHANNEL: Channel<CriticalSectionRawMutex, GnssCommand, 2> = Channel::new();
 
 const CAN_ID_EMERGENCY_STOP_PARA: u16 = 0x003;
 const CAN_ID_STOP_SEQUENCE: u16 = 0x00a;
@@ -116,7 +115,6 @@ const CAN_ID_TEST_TO_POWER_CONTROL: u16 = 0x320;
 const CAN_ID_TEST_FROM_POWER_CONTROL: u16 = 0x321;
 const BUF_SIZE: usize = 8192;
 
-#[repr(C, packed)]
 #[derive(Debug, Copy, Clone)]
 struct Payload {
     add_h: u8,
@@ -154,8 +152,9 @@ impl Payload {
         let size = core::mem::size_of::<Self>();
 
         // 構造体自身をバイトの配列(&[u8])」として強制的に読み替える
-        let bytes: &[u8] =
-            unsafe { core::slice::from_raw_parts(self as *const Self as *const u8, size) };
+        let bytes: &[u8] = &self.to_bytes();
+        // let bytes: &[u8] =
+        //     unsafe { core::slice::from_raw_parts(self as *const Self as *const u8, size) };
 
         let mut sum: u8 = 0;
         // 最初の3バイトと最後の1バイト（check_sum自身）を除いた部分
@@ -164,11 +163,60 @@ impl Payload {
         }
         sum
     }
+    /// ペイロードを安全にバイト配列に変換する
+    pub fn to_bytes(&self) -> [u8; 33] {
+        let mut buf = [0u8; 33];
+        let mut offset = 0;
+
+        buf[offset] = self.add_h;
+        offset += 1;
+        buf[offset] = self.add_l;
+        offset += 1;
+        buf[offset] = self.chnnl;
+        offset += 1;
+        buf[offset] = self.header1;
+        offset += 1;
+        buf[offset] = self.header2;
+        offset += 1;
+        buf[offset] = self.status;
+        offset += 1;
+
+        // i32 -> 4bytes (リトルエンディアン)
+        buf[offset..offset + 4].copy_from_slice(&self.gnss_lat.to_le_bytes());
+        offset += 4;
+        buf[offset..offset + 4].copy_from_slice(&self.gnss_long.to_le_bytes());
+        offset += 4;
+
+        // [i16; 3] -> 6bytes
+        for &val in &self.angle_speed {
+            buf[offset..offset + 2].copy_from_slice(&val.to_le_bytes());
+            offset += 2;
+        }
+        // [i16; 3] -> 6bytes
+        for &val in &self.acceleration {
+            buf[offset..offset + 2].copy_from_slice(&val.to_le_bytes());
+            offset += 2;
+        }
+
+        // i16 -> 2bytes
+        buf[offset..offset + 2].copy_from_slice(&self.air_pressure.to_le_bytes());
+        offset += 2;
+
+        buf[offset] = self.check_sum;
+
+        buf
+    }
 
     /// チェックサムを計算し、check_sum フィールドに代入する
     fn update_checksum(&mut self) {
         self.check_sum = self.calculate_checksum();
     }
+}
+// GNSSの電源ON/OFFを指示するコマンド
+#[derive(Debug, Clone, Copy)]
+enum GnssCommand {
+    TurnOn,
+    TurnOff,
 }
 
 esp_bootloader_esp_idf::esp_app_desc!();
@@ -192,25 +240,16 @@ const fn get_target_can_id(cmd: u8) -> Option<u16> {
     }
 }
 #[embassy_executor::task]
-async fn command_process_task(
-    mut gnss_en_pin: Output<'static>,
-    mut gnss_tx: esp_hal::uart::UartTx<'static, Async>,
-) {
+async fn command_process_task() {
     loop {
         let command = RECEIVED_DATA_CHANNEL.receive().await;
-
         match command {
             // シーケンス制御
             b's' => {
-                gnss_en_pin.set_high();
                 IS_LOGGING.store(true, Ordering::Relaxed);
-                Timer::after(Duration::from_millis(500)).await;
-                gnss_setting(&mut gnss_tx).await;
+                GNSS_CMD_CHANNEL.send(GnssCommand::TurnOn).await;
             }
-            b'e' => {
-                gnss_en_pin.set_low();
-                IS_LOGGING.store(false, Ordering::Relaxed);
-            }
+            b'e' => IS_LOGGING.store(false, Ordering::Relaxed),
 
             // ロギング開始
             b'l' => IS_LOGGING.store(true, Ordering::Relaxed),
@@ -218,12 +257,8 @@ async fn command_process_task(
             b'm' => IS_LOGGING.store(false, Ordering::Relaxed),
 
             // GNSS電源制御
-            b'g' => {
-                gnss_en_pin.set_high();
-                Timer::after(Duration::from_millis(500)).await;
-                gnss_setting(&mut gnss_tx).await;
-            }
-            b'h' => gnss_en_pin.set_low(),
+            b'g' => GNSS_CMD_CHANNEL.send(GnssCommand::TurnOn).await,
+            b'h' => GNSS_CMD_CHANNEL.send(GnssCommand::TurnOff).await,
 
             // CANバスへ流すコマンド
             _ => {
@@ -247,7 +282,6 @@ async fn can_transmit_task(mut tx: twai::TwaiTx<'static, Async>) {
             // コマンド処理タスクからの送信依頼が来た場合
             Either::First((can_id, command)) => {
                 let frame = create_can_frame_to_send(can_id, command);
-
                 // 100msでタイムアウトさせる
                 let result = embassy_time::with_timeout(
                     Duration::from_millis(100),
@@ -298,7 +332,7 @@ async fn can_receive_task(mut rx: twai::TwaiRx<'static, Async>) {
                         status_payload = (status_payload & 0b1011_1111) | 0b0100_0000;
                     }
                     Id::Standard(s_id) if s_id.as_raw() == CAN_ID_ANGLE_SPEED => {
-                        let mut angle_speed = [0u8; 3];
+                        let mut angle_speed = [0u8; 6];
                         angle_speed.copy_from_slice(&payload.data()[0..6]);
                         let mut angle_speed_payload = PAYLOAD_MUTEX.lock().await.angle_speed;
                         for (i, chunk) in angle_speed.chunks_exact(2).enumerate() {
@@ -307,7 +341,7 @@ async fn can_receive_task(mut rx: twai::TwaiRx<'static, Async>) {
                         }
                     }
                     Id::Standard(s_id) if s_id.as_raw() == CAN_ID_ACCELARATION => {
-                        let mut accelaration = [0u8; 3];
+                        let mut accelaration = [0u8; 6];
                         accelaration.copy_from_slice(&payload.data()[0..6]);
                         let mut accelaration_payload = PAYLOAD_MUTEX.lock().await.acceleration;
                         for (i, chunk) in accelaration.chunks_exact(2).enumerate() {
@@ -401,12 +435,7 @@ async fn lora_task(mut uart: Uart<'static, Async>, mut aux_pin: Input<'static>) 
                         let payload_guard = PAYLOAD_MUTEX.lock().await;
                         payload = *payload_guard;
                     }
-                    let payload_bytes: &[u8] = unsafe {
-                        core::slice::from_raw_parts(
-                            &payload as *const _ as *const u8,
-                            core::mem::size_of::<Payload>(),
-                        )
-                    };
+                    let payload_bytes = payload.to_bytes();
                     let _ = uart.write_async(&payload_bytes).await;
                     let _ = uart.flush();
 
@@ -421,12 +450,7 @@ async fn lora_task(mut uart: Uart<'static, Async>, mut aux_pin: Input<'static>) 
                 let payload_guard = PAYLOAD_MUTEX.lock().await;
                 payload = *payload_guard;
             }
-            let payload_bytes: &[u8] = unsafe {
-                core::slice::from_raw_parts(
-                    &payload as *const _ as *const u8,
-                    core::mem::size_of::<Payload>(),
-                )
-            };
+            let payload_bytes = payload.to_bytes();
             let _ = uart.write_async(&payload_bytes).await;
             let _ = uart.flush();
 
@@ -468,16 +492,19 @@ async fn create_lora_payload() {
 }
 
 #[embassy_executor::task]
-async fn gps_receive_task(mut gnss: UartRx<'static, Async>) {
+pub async fn gnss_manager_task(mut uart: Uart<'static, Async>, mut gnss_en: Output<'static>) {
     let mut read_buf = [0u8; 90];
     let mut line_buf = [0u8; 90];
     let mut line_len = 0;
 
     loop {
-        match gnss.read_async(&mut read_buf).await {
-            Ok(0) => continue, // 何もデータがなかったら次の受信待機
-
-            Ok(bytes_read) => {
+        // UARTの受信とコマンドの受信を同時に待ち受ける
+        match select(uart.read_async(&mut read_buf), GNSS_CMD_CHANNEL.receive()).await {
+            //  GNSSからデータを受信した場合
+            Either::First(Ok(bytes_read)) => {
+                if bytes_read == 0 {
+                    continue;
+                }
                 for &letter in &read_buf[..bytes_read] {
                     if letter == b'\r' {
                         continue;
@@ -488,7 +515,11 @@ async fn gps_receive_task(mut gnss: UartRx<'static, Async>) {
                         // line_buf から有効な長さ分だけ、send_bufの先頭にコピーする
                         send_buf[..line_len].copy_from_slice(&line_buf[..line_len]);
                         GNSS_CHANNEL.send(send_buf).await;
-                        RAW_GNSS_CHANNEL.send(send_buf).await;
+                        if let Err(_) = RAW_GNSS_CHANNEL.try_send(send_buf) {
+                            // 満杯の場合は1つ取り出して空きを作り、再度入れる
+                            let _ = RAW_GNSS_CHANNEL.try_receive();
+                            let _ = RAW_GNSS_CHANNEL.try_send(send_buf);
+                        }
                         // 次の行のためにリセット
                         line_len = 0;
                         continue;
@@ -501,7 +532,35 @@ async fn gps_receive_task(mut gnss: UartRx<'static, Async>) {
                     }
                 }
             }
-            Err(_) => {}
+            Either::First(Err(_)) => {} // UART受信エラー
+
+            //  コマンド (ON/OFF) を受信した場合
+            Either::Second(cmd) => {
+                match cmd {
+                    GnssCommand::TurnOn => {
+                        gnss_en.set_high();
+
+                        // 起動直後はデフォルトの9600bpsに戻す
+                        let config_9600 = UartConfig::default().with_baudrate(9600);
+                        uart.apply_config(&config_9600).unwrap();
+
+                        Timer::after(Duration::from_millis(500)).await;
+
+                        // GNSSモジュールに設定コマンド(115200への変更等)を送信
+                        gnss_setting(&mut uart).await;
+
+                        // GNSS側が115200bpsに切り替わるまで少し待機 (重要)
+                        Timer::after(Duration::from_millis(50)).await;
+
+                        // ESP32側のUARTも115200bpsに変更する
+                        let config_115200 = UartConfig::default().with_baudrate(115_200);
+                        uart.apply_config(&config_115200).unwrap();
+                    }
+                    GnssCommand::TurnOff => {
+                        gnss_en.set_low();
+                    }
+                }
+            }
         }
     }
 }
@@ -692,11 +751,11 @@ async fn main(spawner0: Spawner) -> ! {
     let lora_tx = Output::new(peripherals.GPIO11, Level::Low, OutputConfig::default());
     let mut m0 = Output::new(peripherals.GPIO9, Level::Low, OutputConfig::default());
     let mut m1 = Output::new(peripherals.GPIO10, Level::Low, OutputConfig::default());
-    let gps_tx = Output::new(peripherals.GPIO21, Level::Low, OutputConfig::default());
-    let mut gps_en = Output::new(peripherals.GPIO13, Level::Low, OutputConfig::default());
+    let gnss_tx = Output::new(peripherals.GPIO21, Level::Low, OutputConfig::default());
+    let mut gnss_en = Output::new(peripherals.GPIO13, Level::Low, OutputConfig::default());
     let aux_pin = Input::new(peripherals.GPIO8, InputConfig::default());
     let lora_rx = Input::new(peripherals.GPIO12, InputConfig::default());
-    let gps_rx = Input::new(peripherals.GPIO14, InputConfig::default());
+    let gnss_rx = Input::new(peripherals.GPIO14, InputConfig::default());
 
     // --- SPI ---
     let spi_bus = Spi::new(
@@ -739,18 +798,14 @@ async fn main(spawner0: Spawner) -> ! {
         .with_stop_bits(StopBits::_1);
     let mut uart1 = Uart::new(peripherals.UART1, uart_config1)
         .unwrap()
-        .with_rx(gps_rx)
-        .with_tx(gps_tx)
+        .with_rx(gnss_rx)
+        .with_tx(gnss_tx)
         .into_async();
-    // let new_config = UartConfig::default().with_baudrate(115_200);
-    // uart1.apply_config(&new_config).unwrap();
-    // gps_en.set_high();
-    let (gnss_rx, gnss_tx) = uart1.split();
 
     // spawn tasks on core0
-    spawner0.spawn(gps_receive_task(gnss_rx)).ok();
+    spawner0.spawn(gnss_manager_task(uart1, gnss_en)).ok();
     spawner0.spawn(sd_write_task(volume_mgr)).ok();
-    spawner0.spawn(command_process_task(gps_en, gnss_tx)).ok();
+    spawner0.spawn(command_process_task()).ok();
     // spawn tasks on core1
     esp_rtos::start_second_core(
         peripherals.CPU_CTRL,
