@@ -40,7 +40,8 @@ impl TimeSource for SdTimeSource {
     fn get_timestamp(&self) -> Timestamp {
         let now_us = self.current_time();
         // Convert to jiff Time
-        let now = jiff::Timestamp::from_microsecond(now_us as i64).unwrap();
+        let now = jiff::Timestamp::from_microsecond(now_us as i64)
+            .unwrap_or_else(|_| jiff::Timestamp::from_second(0).unwrap());
         let now = now.to_zoned(TZ.clone());
         Timestamp {
             year_since_1970: (now.year() - 1970).unsigned_abs() as u8,
@@ -618,20 +619,40 @@ async fn sd_write_task(
     let mut tlm_buffer = [0u8; BUF_SIZE]; // payload + time stamp
     let mut raw_cursor = 0;
     let mut tlm_cursor = 0;
-    let volume0 = volume_mgr.open_volume(VolumeIdx(0)).unwrap();
-    let root_dir = volume0.open_root_dir().unwrap();
-    let mut raw_gnss_file = root_dir
-        .open_file_in_dir(
-            "GNSS_RAW.TXT",
-            embedded_sdmmc::Mode::ReadWriteCreateOrAppend,
-        )
-        .unwrap();
-    let mut tlm_file = root_dir
-        .open_file_in_dir(
-            "TELEMETRY.CSV",
-            embedded_sdmmc::Mode::ReadWriteCreateOrAppend,
-        )
-        .unwrap();
+    let mut volume0 = match volume_mgr.open_volume(VolumeIdx(0)) {
+        Ok(v) => v,
+        Err(e) => {
+            println!("SD Volume Error: {:?}", e);
+            return; // SDカード異常時はタスクを終了
+        }
+    };
+    let mut root_dir = match volume0.open_root_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            println!("SD Root Dir Error: {:?}", e);
+            return;
+        }
+    };
+    let mut raw_gnss_file = match root_dir.open_file_in_dir(
+        "GNSS_RAW.TXT",
+        embedded_sdmmc::Mode::ReadWriteCreateOrAppend,
+    ) {
+        Ok(f) => f,
+        Err(e) => {
+            println!("SD File Error (GNSS): {:?}", e);
+            return;
+        }
+    };
+    let mut tlm_file = match root_dir.open_file_in_dir(
+        "TELEMETRY.CSV",
+        embedded_sdmmc::Mode::ReadWriteCreateOrAppend,
+    ) {
+        Ok(f) => f,
+        Err(e) => {
+            println!("SD File Error (TLM): {:?}", e);
+            return;
+        }
+    };
     // CSVのヘッダー
     let header = b"Time_ms,Status,Lat,Long,GyroX,GyroY,GyroZ,AccX,AccY,AccZ,Press,Speed,Course\n";
     let _ = tlm_file.write(header);
@@ -778,7 +799,11 @@ async fn main(spawner0: Spawner) -> ! {
     let rtc = Rtc::new(peripherals.LPWR);
     let sd_timer = SdTimeSource::new(rtc);
     let sdcard = SdCard::new(spi_dev, Delay);
-    let sd_size = sdcard.num_bytes().unwrap();
+    if let Ok(sd_size) = sdcard.num_bytes() {
+        println!("SD Card Size: {} bytes", sd_size);
+    } else {
+        println!("Failed to get SD Card size.");
+    }
     // To do this we need a Volume Manager. It will take ownership of the block device.
     static VOLUME_MGR: StaticCell<
         VolumeManager<

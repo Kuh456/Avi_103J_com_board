@@ -1,6 +1,6 @@
 #![no_std]
 use core::str::FromStr;
-
+use esp_println::println;
 // --- エラー定義 ---
 #[derive(Debug, PartialEq)]
 pub enum GgaParseError {
@@ -300,9 +300,16 @@ pub const UART_BAUD: &[u8] = &[
 
 async fn send_cmd(tx: &mut esp_hal::uart::Uart<'static, esp_hal::Async>, mut data: &[u8]) {
     while !data.is_empty() {
-        let written = tx.write_async(data).await.unwrap();
-        // 書き込めた分だけスライスの先頭を削って、残りを次のループで送る
-        data = &data[written..];
+        match tx.write_async(data).await {
+            Ok(written) => {
+                // 書き込めた分だけスライスの先頭を削って、残りを次のループで送る
+                data = &data[written..];
+            }
+            Err(_) => {
+                // println!("UART write error during GNSS setup");
+                break;
+            }
+        }
     }
 }
 pub async fn gnss_setting(tx: &mut esp_hal::uart::Uart<'static, esp_hal::Async>) {
@@ -314,5 +321,5 @@ pub async fn gnss_setting(tx: &mut esp_hal::uart::Uart<'static, esp_hal::Async>)
     send_cmd(tx, SLAS_EN).await;
     send_cmd(tx, DYNAMIC_MODEL_AIRBORNE_4G).await;
     send_cmd(tx, UART_BAUD).await;
-    tx.flush_async().await.unwrap();
+    let _ = tx.flush_async().await;
 }
