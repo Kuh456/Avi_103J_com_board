@@ -83,7 +83,7 @@ static GNSS_CHANNEL: Channel<CriticalSectionRawMutex, GnssPacket, 5> = Channel::
 static RMC_CHANNEL: Channel<CriticalSectionRawMutex, [f32; 2], 5> = Channel::new();
 static RECEIVED_DATA_CHANNEL: Channel<CriticalSectionRawMutex, u8, 10> = Channel::new();
 static PAYLOAD_MUTEX: Mutex<CriticalSectionRawMutex, Payload> = Mutex::new(Payload::new());
-static RAW_GNSS_CHANNEL: Channel<CriticalSectionRawMutex, GnssPacket, 10> = Channel::new();
+static RAW_GNSS_CHANNEL: Channel<CriticalSectionRawMutex, GnssPacket, 30> = Channel::new();
 static IS_LOGGING: AtomicBool = AtomicBool::new(false);
 static HAS_UNFLUSHED_DATA: AtomicBool = AtomicBool::new(false);
 static CAN_TX_CHANNEL: Channel<CriticalSectionRawMutex, (u16, u8), 5> = Channel::new();
@@ -323,17 +323,17 @@ async fn can_receive_task(mut rx: twai::TwaiRx<'static, Async>) {
                 match payload.id() {
                     Id::Standard(s_id) if s_id.as_raw() == CAN_ID_LIFT_OFF => {
                         TRIGGER_SIGNAL.signal(true);
-                        let mut status_payload = PAYLOAD_MUTEX.lock().await.status;
-                        status_payload = (status_payload & 0b1011_1111) | 0b0100_0000;
+                        let mut status_payload = PAYLOAD_MUTEX.lock().await;
+                        status_payload.status = (status_payload.status & 0b1011_1111) | 0b0100_0000;
                     }
                     Id::Standard(s_id) if s_id.as_raw() == CAN_ID_ANGLE_SPEED => {
                         if payload.data().len() >= 6 {
                             let mut angle_speed = [0u8; 6];
                             angle_speed.copy_from_slice(&payload.data()[0..6]);
-                            let mut angle_speed_payload = PAYLOAD_MUTEX.lock().await.angle_speed;
+                            let mut angle_speed_payload = PAYLOAD_MUTEX.lock().await;
                             for (i, chunk) in angle_speed.chunks_exact(2).enumerate() {
                                 // chunk は [u8; 2] に変換（try_into）してから i16 にする
-                                angle_speed_payload[i] =
+                                angle_speed_payload.angle_speed[i] =
                                     i16::from_le_bytes(chunk.try_into().unwrap());
                             }
                         }
@@ -342,10 +342,10 @@ async fn can_receive_task(mut rx: twai::TwaiRx<'static, Async>) {
                         if payload.data().len() >= 6 {
                             let mut accelaration = [0u8; 6];
                             accelaration.copy_from_slice(&payload.data()[0..6]);
-                            let mut accelaration_payload = PAYLOAD_MUTEX.lock().await.acceleration;
+                            let mut accelaration_payload = PAYLOAD_MUTEX.lock().await;
                             for (i, chunk) in accelaration.chunks_exact(2).enumerate() {
                                 // chunk は [u8; 2] に変換（try_into）してから i16 にする
-                                accelaration_payload[i] =
+                                accelaration_payload.acceleration[i] =
                                     i16::from_le_bytes(chunk.try_into().unwrap());
                             }
                         }
@@ -354,40 +354,41 @@ async fn can_receive_task(mut rx: twai::TwaiRx<'static, Async>) {
                         if payload.data().len() >= 2 {
                             let mut air_pressure = [0u8; 2];
                             air_pressure.copy_from_slice(&payload.data()[0..2]);
-                            let mut air_pressure_payload = PAYLOAD_MUTEX.lock().await.air_pressure;
-                            air_pressure_payload =
+                            let mut air_pressure_payload = PAYLOAD_MUTEX.lock().await;
+                            air_pressure_payload.air_pressure =
                                 i16::from_le_bytes(air_pressure.try_into().unwrap());
                         }
                     }
                     Id::Standard(s_id) if s_id.as_raw() == CAN_ID_TOP => {
                         TRIGGER_SIGNAL.signal(true);
-                        let mut status_payload = PAYLOAD_MUTEX.lock().await.status;
-                        status_payload = (status_payload & 0b0111_1111) | 0b1000_0000;
+                        let mut status_payload = PAYLOAD_MUTEX.lock().await;
+                        status_payload.status = (status_payload.status & 0b0111_1111) | 0b1000_0000;
                     }
                     Id::Standard(s_id) if s_id.as_raw() == CAN_ID_CAMERA_STATUS => {
                         let status = payload.data()[0];
-                        let mut status_payload = PAYLOAD_MUTEX.lock().await.status;
+                        let mut status_payload = PAYLOAD_MUTEX.lock().await;
 
                         // (*status_payload & 0b1111_1000) -> 上位5bitだけ残して下位3bitを0にする
                         // (status & 0b0000_0111) -> 受け取ったデータの下位3bitだけ抽出する
-                        status_payload = (status_payload & 0b1111_1000) | (status & 0b0000_0111);
+                        status_payload.status =
+                            (status_payload.status & 0b1111_1000) | (status & 0b0000_0111);
                     }
                     Id::Standard(s_id) if s_id.as_raw() == CAN_ID_TEST_FROM_LOG_PARA => {
-                        let mut status_payload = PAYLOAD_MUTEX.lock().await.status;
-                        status_payload = (status_payload & 0b1111_0111) | 0b0000_1000;
+                        let mut status_payload = PAYLOAD_MUTEX.lock().await;
+                        status_payload.status = (status_payload.status & 0b1111_0111) | 0b0000_1000;
                         // 受信時刻を更新
                         *LAST_SEEN_LOG.lock().await = Some(Instant::now());
                     }
                     Id::Standard(s_id) if s_id.as_raw() == CAN_ID_TEST_FROM_CAMERA => {
-                        let mut status_payload = PAYLOAD_MUTEX.lock().await.status;
-                        status_payload = (status_payload & 0b1110_1111) | 0b0001_0000;
+                        let mut status_payload = PAYLOAD_MUTEX.lock().await;
+                        status_payload.status = (status_payload.status & 0b1110_1111) | 0b0001_0000;
                         // 受信時刻を更新
                         *LAST_SEEN_CAMERA.lock().await = Some(Instant::now());
                     }
                     Id::Standard(s_id) if s_id.as_raw() == CAN_ID_TEST_FROM_POWER_CONTROL => {
                         let status = payload.data()[0];
-                        let mut status_payload = PAYLOAD_MUTEX.lock().await.status;
-                        status_payload = (status_payload & 0b1101_1111) | 0b0010_0000;
+                        let mut status_payload = PAYLOAD_MUTEX.lock().await;
+                        status_payload.status = (status_payload.status & 0b1101_1111) | 0b0010_0000;
                         // 受信時刻を更新
                         *LAST_SEEN_POWER.lock().await = Some(Instant::now());
                     }
@@ -424,10 +425,12 @@ async fn lora_task(mut uart: Uart<'static, Async>, mut aux_pin: Input<'static>) 
                         is_tx_only_mode = true;
                     }
                 }
-                Either3::Second(Ok(_)) => {
+                Either3::Second(Ok(len)) => {
                     // 受信処理
                     // rx_bufの0番目の値(u8)を取り出して、そのまま送信
-                    RECEIVED_DATA_CHANNEL.send(rx_buf[0]).await;
+                    if len > 0 {
+                        RECEIVED_DATA_CHANNEL.send(rx_buf[0]).await;
+                    }
                 }
                 Either3::Second(Err(_)) => {
                     // UART受信エラー時の処理
@@ -524,15 +527,17 @@ pub async fn gnss_manager_task(mut uart: Uart<'static, Async>, mut gnss_en: Outp
                         continue;
                     }
                     if letter == b'\n' {
-                        // 送信用に0で初期化された新しい配列を作る
-                        let mut send_buf = [0u8; 90];
-                        // line_buf から有効な長さ分だけ、send_bufの先頭にコピーする
-                        send_buf[..line_len].copy_from_slice(&line_buf[..line_len]);
-                        GNSS_CHANNEL.send(send_buf).await;
-                        if let Err(_) = RAW_GNSS_CHANNEL.try_send(send_buf) {
-                            // 満杯の場合は1つ取り出して空きを作り、再度入れる
-                            let _ = RAW_GNSS_CHANNEL.try_receive();
-                            let _ = RAW_GNSS_CHANNEL.try_send(send_buf);
+                        if line_len > 0 && line_buf[0] == b'$' {
+                            // 送信用に0で初期化された新しい配列を作る
+                            let mut send_buf = [0u8; 90];
+                            // line_buf から有効な長さ分だけ、send_bufの先頭にコピーする
+                            send_buf[..line_len].copy_from_slice(&line_buf[..line_len]);
+                            GNSS_CHANNEL.send(send_buf).await;
+                            if let Err(_) = RAW_GNSS_CHANNEL.try_send(send_buf) {
+                                // 満杯の場合は1つ取り出して空きを作り、再度入れる
+                                let _ = RAW_GNSS_CHANNEL.try_receive();
+                                let _ = RAW_GNSS_CHANNEL.try_send(send_buf);
+                            }
                         }
                         // 次の行のためにリセット
                         line_len = 0;
