@@ -408,47 +408,40 @@ async fn can_receive_task(mut rx: twai::TwaiRx<'static, Async>) {
 async fn lora_task(mut uart: Uart<'static, Async>, mut aux_pin: Input<'static>) {
     let mut is_tx_only_mode = false;
     let mut rx_buf = [0u8; 64];
-
+    let mut last_tx = Instant::now();
     loop {
         if !is_tx_only_mode {
             // --- 送受信モード (受信メイン) ---
-            let trigger_fut = TRIGGER_SIGNAL.wait();
-            let rx_fut = uart.read_async(&mut rx_buf);
-
-            // 3秒経過したら送信を行うタイマー
-            let tx_timer_fut = Timer::after(Duration::from_secs(3));
-
-            // 3つのイベントを同時に待ち受け、最初に完了したものを処理する
-            match select3(trigger_fut, rx_fut, tx_timer_fut).await {
-                Either3::First(trigger) => {
+            let receive_fut = select(TRIGGER_SIGNAL.wait(), uart.read_async(&mut rx_buf));
+            match embassy_time::with_timeout(Duration::from_secs(3), receive_fut).await {
+                Ok(Either::First(trigger)) => {
                     if trigger {
                         is_tx_only_mode = true;
                     }
                 }
-                Either3::Second(Ok(len)) => {
+                Ok(Either::Second(Ok(len))) => {
                     // 受信処理
-                    // rx_bufの0番目の値(u8)を取り出して、そのまま送信
                     if len > 0 {
                         RECEIVED_DATA_CHANNEL.send(rx_buf[0]).await;
                     }
                 }
-                Either3::Second(Err(_)) => {
-                    // UART受信エラー時の処理
+                Ok(Either::Second(Err(_))) => {} // UART受信エラー時の処理
+                Err(_) => {}                     //タイムアウト
+            }
+            if last_tx.elapsed().as_secs() >= 3 {
+                // 送信処理
+                let mut payload = Payload::new();
+                {
+                    let payload_guard = PAYLOAD_MUTEX.lock().await;
+                    payload = *payload_guard;
                 }
-                Either3::Third(_) => {
-                    // 送信処理
-                    let mut payload = Payload::new();
-                    {
-                        let payload_guard = PAYLOAD_MUTEX.lock().await;
-                        payload = *payload_guard;
-                    }
-                    let payload_bytes = payload.to_bytes();
-                    let _ = uart.write_async(&payload_bytes).await;
-                    let _ = uart.flush();
+                let payload_bytes = payload.to_bytes();
+                let _ = uart.write_async(&payload_bytes).await;
+                let _ = uart.flush();
 
-                    // UARTに書き込んだ後、実際にLoRaで送信完了するまでAUXピンがLOW
-                    aux_pin.wait_for_high().await;
-                }
+                // UARTに書き込んだ後、実際にLoRaで送信完了するまでAUXピンがLOW
+                aux_pin.wait_for_high().await;
+                last_tx = Instant::now();
             }
         } else {
             // 送信専用モード
@@ -532,7 +525,10 @@ pub async fn gnss_manager_task(mut uart: Uart<'static, Async>, mut gnss_en: Outp
                             let mut send_buf = [0u8; 90];
                             // line_buf から有効な長さ分だけ、send_bufの先頭にコピーする
                             send_buf[..line_len].copy_from_slice(&line_buf[..line_len]);
-                            GNSS_CHANNEL.send(send_buf).await;
+                            if let Err(_) = GNSS_CHANNEL.try_send(send_buf) {
+                                let _ = GNSS_CHANNEL.try_receive();
+                                let _ = GNSS_CHANNEL.try_send(send_buf);
+                            }
                             if let Err(_) = RAW_GNSS_CHANNEL.try_send(send_buf) {
                                 // 満杯の場合は1つ取り出して空きを作り、再度入れる
                                 let _ = RAW_GNSS_CHANNEL.try_receive();
@@ -591,7 +587,10 @@ async fn parse_gnss_task() {
             Ok(rmc_data) => {
                 if let (Some(speed), Some(degree)) = (rmc_data.speed_kmh, rmc_data.true_course) {
                     let velocity = [speed, degree];
-                    RMC_CHANNEL.send(velocity).await;
+                    if let Err(_) = RMC_CHANNEL.try_send(velocity) {
+                        let _ = RMC_CHANNEL.try_receive();
+                        let _ = RMC_CHANNEL.try_send(velocity);
+                    }
                 }
             }
             Err(_e) => {
@@ -641,44 +640,35 @@ async fn sd_write_task(
     // CSVのヘッダー
     let header = b"Time_ms,Status,Lat,Long,GyroX,GyroY,GyroZ,AccX,AccY,AccZ,Press,Speed,Course\n";
     let _ = tlm_file.write(header);
+    let mut last_flush = Instant::now();
     loop {
         let flush_timer = Timer::after(Duration::from_secs(5));
         let has_data = raw_cursor > 0 || tlm_cursor > 0;
         HAS_UNFLUSHED_DATA.store(has_data, Ordering::Relaxed);
         let is_logging = IS_LOGGING.load(Ordering::Relaxed);
-        match select3(
-            RAW_GNSS_CHANNEL.receive(),
-            RMC_CHANNEL.receive(),
-            flush_timer,
-        )
-        .await
-        {
-            //  生のGNSSデータを受信した場合 (GNSS_RAW.TXT )
-            Either3::First(raw_gnss_data) => {
+        let receive_fut = select(RAW_GNSS_CHANNEL.receive(), RMC_CHANNEL.receive());
+        match embassy_time::with_timeout(Duration::from_secs(5), receive_fut).await {
+            // 生のGNSSデータを受信した場合
+            Ok(Either::First(raw_gnss_data)) => {
                 if is_logging {
-                    // 後半の 0 埋め部分を無視して有効な長さを取得
                     let valid_len = raw_gnss_data
                         .iter()
                         .position(|&x| x == 0)
                         .unwrap_or(raw_gnss_data.len());
                     let valid_bytes = &raw_gnss_data[..valid_len];
 
-                    // バッファが溢れそうならSDに書き出してカーソルをリセット
                     if raw_cursor + valid_bytes.len() > BUF_SIZE {
                         let _ = raw_gnss_file.write(&raw_buffer[..raw_cursor]);
                         let _ = raw_gnss_file.flush();
                         raw_cursor = 0;
                     }
-
-                    // バッファに追記
                     raw_buffer[raw_cursor..raw_cursor + valid_bytes.len()]
                         .copy_from_slice(valid_bytes);
                     raw_cursor += valid_bytes.len();
                 }
             }
-
-            // RMCデータ(速度と方位)を受信した場合 (TELEMETRY.CSV へ書き込み)
-            Either3::Second([speed, course]) => {
+            // RMCデータを受信した場合
+            Ok(Either::Second([speed, course])) => {
                 if is_logging {
                     let payload = { *PAYLOAD_MUTEX.lock().await };
                     let now_ms = Instant::now().as_millis();
@@ -715,34 +705,36 @@ async fn sd_write_task(
                     );
 
                     let line_bytes = csv_line.as_bytes();
-
-                    // バッファが溢れそうならSDに書き出してカーソルをリセット
                     if tlm_cursor + line_bytes.len() > BUF_SIZE {
                         let _ = tlm_file.write(&tlm_buffer[..tlm_cursor]);
                         let _ = tlm_file.flush();
                         tlm_cursor = 0;
                     }
-
-                    // バッファに追記
                     tlm_buffer[tlm_cursor..tlm_cursor + line_bytes.len()]
                         .copy_from_slice(line_bytes);
                     tlm_cursor += line_bytes.len();
                 }
             }
-            Either3::Third(_) => {
-                // GNSS生データのバッファに何か溜まっていればSDに書き込んでフラッシュ
-                if raw_cursor > 0 {
-                    let _ = raw_gnss_file.write(&raw_buffer[..raw_cursor]);
-                    let _ = raw_gnss_file.flush();
-                    raw_cursor = 0;
-                }
-                // テレメトリデータのバッファに何か溜まっていればSDに書き込んでフラッシュ
-                if tlm_cursor > 0 {
-                    let _ = tlm_file.write(&tlm_buffer[..tlm_cursor]);
-                    let _ = tlm_file.flush();
-                    tlm_cursor = 0;
-                }
+            // 5秒間どちらのチャンネルからもデータが来なかった場合（GPS未測位など）
+            Err(_) => {
+                // ここでは何もせず、下のフラッシュ処理に任せる
             }
+        }
+
+        // ⭕ ループの終わりに「前回のフラッシュから5秒経過したか？」を絶対時間でチェック
+        if last_flush.elapsed().as_secs() >= 5 {
+            if raw_cursor > 0 {
+                let _ = raw_gnss_file.write(&raw_buffer[..raw_cursor]);
+                let _ = raw_gnss_file.flush();
+                raw_cursor = 0;
+            }
+            if tlm_cursor > 0 {
+                let _ = tlm_file.write(&tlm_buffer[..tlm_cursor]);
+                let _ = tlm_file.flush();
+                tlm_cursor = 0;
+            }
+            // フラッシュが完了したら、基準時刻を現在時刻にリセット
+            last_flush = Instant::now();
         }
     }
 }
