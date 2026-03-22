@@ -48,16 +48,16 @@ pub struct UtcTime {
 
 #[derive(Debug, Default, PartialEq)]
 pub struct GgaData {
-    pub utc_time: Option<UtcTime>,
-    pub latitude: Option<i32>,
-    pub longitude: Option<i32>,
-    pub fix_quality: FixQuality,
-    pub satellites: u8,
-    pub altitude: Option<f32>,  // 海抜高度
-    pub geoid_sep: Option<f32>, // ジオイド高
+    pub utc_time: Option<UtcTime>, // 協定世界時
+    pub latitude: Option<i32>,     // 緯度
+    pub longitude: Option<i32>,    // 経度
+    pub fix_quality: FixQuality,   // 測位品質
+    pub satellites: u8,            // 捕捉している衛星数
+    pub altitude: Option<f32>,     // 海抜高度
+    pub geoid_sep: Option<f32>,    // ジオイド高
 }
 impl GgaData {
-    /// ジオイド高を用いて「WGS84楕円体高」を計算して返す
+    /// ジオイド高を用いて楕円体高を計算して返す
     pub fn ellipsoid_height(&self) -> Option<f32> {
         if let (Some(alt), Some(geoid)) = (self.altitude, self.geoid_sep) {
             Some(alt + geoid) // 海抜高度 + ジオイド高 = 楕円体高
@@ -67,9 +67,9 @@ impl GgaData {
     }
 }
 
-/// バイト配列から数値(f32, f64, u8等)をパースするヘルパー
+/// バイト配列から数値(f32, f64, u8等)をパースする
 fn parse_num<T: FromStr>(bytes: &[u8]) -> Result<T, GgaParseError> {
-    // 必要な部分だけをstrに変換してパース（ASCII前提なので安全かつ高速）
+    // 必要な部分だけをstrに変換してパース
     let s = core::str::from_utf8(bytes).map_err(|_| GgaParseError::ParseError)?;
     s.parse::<T>().map_err(|_| GgaParseError::ParseError)
 }
@@ -93,7 +93,7 @@ fn parse_utc_time(bytes: &[u8]) -> Result<UtcTime, GgaParseError> {
 /// NMEA(ddmm.mmmm) → decimal degree
 /// hemisphereは1バイト文字 (b'N', b'S', b'E', b'W')
 fn nmea_to_decimal(nmea_val: f64, hemisphere: u8) -> Result<f64, GgaParseError> {
-    // no_std環境のためキャストで整数部(度)を取得
+    // 整数部(度)を取得
     let degrees = (nmea_val / 100.0) as i32 as f64;
     let minutes = nmea_val - degrees * 100.0;
     let decimal = degrees + minutes / 60.0;
@@ -154,7 +154,7 @@ pub fn parse_gga(sentence: &[u8]) -> Result<GgaData, GgaParseError> {
 
     let data_bytes = &sentence[1..star_idx];
 
-    // b',' (カンマのバイト値) で分割
+    // b','で分割
     let mut fields = data_bytes.split(|&b| b == b',');
 
     let talker = fields.next().ok_or(GgaParseError::MissingField)?;
@@ -175,7 +175,7 @@ pub fn parse_gga(sentence: &[u8]) -> Result<GgaData, GgaParseError> {
     let alt_bytes = fields.next().ok_or(GgaParseError::MissingField)?;
     let alt_unit = fields.next().ok_or(GgaParseError::MissingField)?;
     let geoid_bytes = fields.next().ok_or(GgaParseError::MissingField)?;
-    // 測位前は空文字 b"" ではなく、Mかどうかのチェック (b"M"と比較)
+    // 測位前は空文字 b"" ではなく、Mかどうかのチェック
     if !alt_unit.is_empty() && alt_unit != b"M" {
         return Err(GgaParseError::InvalidUnit);
     }
