@@ -70,7 +70,7 @@ use esp_hal::{
     twai::{self, BaudRate, EspTwaiFrame, StandardId, TwaiMode, filter::SingleStandardFilter},
     uart::{Config as UartConfig, DataBits, Parity, StopBits, Uart, UartRx},
 };
-use esp_println::println;
+use esp_println::{print, println};
 use esp_rtos::embassy::Executor;
 use static_cell::StaticCell;
 // 各ノードからの最終受信時刻
@@ -501,6 +501,11 @@ pub async fn gnss_manager_task(mut uart: Uart<'static, Async>, mut gnss_en: Outp
                     continue;
                 }
                 for &letter in &read_buf[..bytes_read] {
+                    if let Ok(s) = core::str::from_utf8(&read_buf[..bytes_read]) {
+                        print!("{}", s);
+                    } else {
+                        println!("(Garbage Data: {:?})", &read_buf[..bytes_read]);
+                    }
                     if letter == b'$' {
                         line_len = 0;
                         line_buf[line_len] = letter;
@@ -517,6 +522,7 @@ pub async fn gnss_manager_task(mut uart: Uart<'static, Async>, mut gnss_en: Outp
                             let mut send_buf = [0u8; 90];
                             // line_buf から有効な長さ分だけ、send_bufの先頭にコピーする
                             send_buf[..line_len].copy_from_slice(&line_buf[..line_len]);
+                            println!("raw gnss: {:?}", send_buf);
                             if let Err(_) = GNSS_CHANNEL.try_send(send_buf) {
                                 let _ = GNSS_CHANNEL.try_receive();
                                 let _ = GNSS_CHANNEL.try_send(send_buf);
@@ -537,7 +543,9 @@ pub async fn gnss_manager_task(mut uart: Uart<'static, Async>, mut gnss_en: Outp
                     }
                 }
             }
-            Either::First(Err(_)) => {} // UART受信エラー
+            Either::First(Err(e)) => {
+                println!("UART receive error{:?}", e);
+            } // UART受信エラー
 
             //  コマンド (ON/OFF) を受信した場合
             Either::Second(cmd) => {
@@ -589,7 +597,8 @@ async fn parse_gnss_task() {
                     *latest = [speed, degree];
                 }
             }
-            Err(_e) => {
+            Err(e) => {
+                println!("parse err:{:?}", e);
                 // パース失敗やrmc以外のセンテンスだった場合の処理
             }
         }
@@ -599,9 +608,11 @@ async fn parse_gnss_task() {
                     let location = [lat, lon];
                     let mut payload_gnss = PAYLOAD_MUTEX.lock().await;
                     [payload_gnss.gnss_lat, payload_gnss.gnss_long] = location;
+                    println!("gnss: {:?}", location);
                 }
             }
-            Err(_e) => {
+            Err(e) => {
+                println!("parse err:{:?}", e);
                 // パース失敗やGGA以外のセンテンスだった場合の処理
             }
         }
@@ -660,10 +671,26 @@ async fn sd_write_task(
     }
     let mut last_flush = Instant::now();
     let mut ticker = Ticker::every(Duration::from_millis(500));
+    let mut prev_is_logging = false;
     loop {
+        let is_logging = IS_LOGGING.load(Ordering::Relaxed);
+        if is_logging && !prev_is_logging {
+        } else if !is_logging && prev_is_logging {
+            if raw_cursor > 0 {
+                let _ = raw_gnss_file.write(&raw_buffer[..raw_cursor]);
+                raw_cursor = 0;
+            }
+            if tlm_cursor > 0 {
+                let _ = tlm_file.write(&tlm_buffer[..tlm_cursor]);
+                tlm_cursor = 0;
+            }
+            let _ = raw_gnss_file.flush();
+            let _ = tlm_file.flush();
+            println!("SDカードへの書き込み完了");
+        }
+        prev_is_logging = is_logging;
         let has_data = raw_cursor > 0 || tlm_cursor > 0;
         HAS_UNFLUSHED_DATA.store(has_data, Ordering::Relaxed);
-        let is_logging = IS_LOGGING.load(Ordering::Relaxed);
         match select(RAW_GNSS_CHANNEL.receive(), ticker.next()).await {
             Either::First(raw_gnss_data) => {
                 if is_logging {
@@ -744,7 +771,11 @@ async fn sd_write_task(
                 raw_cursor = 0;
             }
             if tlm_cursor > 0 {
-                let _ = tlm_file.write(&tlm_buffer[..tlm_cursor]);
+                match tlm_file.write(&tlm_buffer[..tlm_cursor]) {
+                    Ok(size) => println!("TLMCSV: 定期フラッシュ成功 ({:?} bytes)", size),
+                    Err(e) => println!("TLM CSV: 定期フラッシュ失敗 {:?}", e),
+                }
+                // let _ = tlm_file.write(&tlm_buffer[..tlm_cursor]);
                 let _ = tlm_file.flush();
                 tlm_cursor = 0;
             }
@@ -775,11 +806,11 @@ async fn main(spawner0: Spawner) -> ! {
     let lora_tx = Output::new(peripherals.GPIO11, Level::Low, OutputConfig::default());
     let mut m0 = Output::new(peripherals.GPIO9, Level::Low, OutputConfig::default());
     let mut m1 = Output::new(peripherals.GPIO10, Level::Low, OutputConfig::default());
-    let gnss_tx = Output::new(peripherals.GPIO21, Level::Low, OutputConfig::default());
+    let gnss_tx = Output::new(peripherals.GPIO14, Level::Low, OutputConfig::default());
     let mut gnss_en = Output::new(peripherals.GPIO13, Level::Low, OutputConfig::default());
     let aux_pin = Input::new(peripherals.GPIO8, InputConfig::default());
     let lora_rx = Input::new(peripherals.GPIO12, InputConfig::default());
-    let gnss_rx = Input::new(peripherals.GPIO14, InputConfig::default());
+    let gnss_rx = Input::new(peripherals.GPIO21, InputConfig::default());
 
     // --- SPI ---
     let spi_bus = Spi::new(
