@@ -73,10 +73,11 @@ use esp_hal::{
 use esp_println::{print, println};
 use esp_rtos::embassy::Executor;
 use static_cell::StaticCell;
+
 // 各ノードからの最終受信時刻
 static LAST_SEEN_LOG: Mutex<CriticalSectionRawMutex, Option<Instant>> = Mutex::new(None);
 static LAST_SEEN_CAMERA: Mutex<CriticalSectionRawMutex, Option<Instant>> = Mutex::new(None);
-static LAST_SEEN_POWER: Mutex<CriticalSectionRawMutex, Option<Instant>> = Mutex::new(None);
+// static LAST_SEEN_POWER: Mutex<CriticalSectionRawMutex, Option<Instant>> = Mutex::new(None);
 
 type GnssPacket = [u8; 90];
 static TRIGGER_SIGNAL: Signal<CriticalSectionRawMutex, bool> = Signal::new();
@@ -112,9 +113,10 @@ const CAN_ID_TEST_TO_LOG_PARA: u16 = 0x300;
 const CAN_ID_TEST_FROM_LOG_PARA: u16 = 0x301;
 const CAN_ID_TEST_TO_CAMERA: u16 = 0x310;
 const CAN_ID_TEST_FROM_CAMERA: u16 = 0x311;
-const CAN_ID_TEST_TO_POWER_CONTROL: u16 = 0x320;
-const CAN_ID_TEST_FROM_POWER_CONTROL: u16 = 0x321;
-const BUF_SIZE: usize = 8192;
+// const CAN_ID_TEST_TO_POWER_CONTROL: u16 = 0x320;
+// const CAN_ID_TEST_FROM_POWER_CONTROL: u16 = 0x321;
+const BUF_SIZE: usize = 2048;
+const LORA_TRANSMIT_INTERVAL_MS: u64 = 2500;
 
 #[derive(Debug, Copy, Clone)]
 struct Payload {
@@ -213,8 +215,9 @@ enum GnssCommand {
 }
 
 esp_bootloader_esp_idf::esp_app_desc!();
-fn create_can_frame_to_send(can_id: u16, cmd: u8) -> EspTwaiFrame {
-    EspTwaiFrame::new(StandardId::new(can_id).unwrap(), &[cmd]).unwrap()
+fn create_can_frame_to_send(can_id: u16, cmd: u8) -> Option<EspTwaiFrame> {
+    let id = StandardId::new(can_id)?;
+    EspTwaiFrame::new(id, &[cmd])
 }
 const fn get_target_can_id(cmd: u8) -> Option<u16> {
     match cmd {
@@ -241,8 +244,14 @@ async fn command_process_task() {
             b's' => {
                 IS_LOGGING.store(true, Ordering::Relaxed);
                 GNSS_CMD_CHANNEL.send(GnssCommand::TurnOn).await;
+                let mut status_payload = PAYLOAD_MUTEX.lock().await;
+                status_payload.status = (status_payload.status & 0b1101_1111) | 0b0010_0000;
             }
-            b'e' => IS_LOGGING.store(false, Ordering::Relaxed),
+            b'e' => {
+                IS_LOGGING.store(false, Ordering::Relaxed);
+                let mut status_payload = PAYLOAD_MUTEX.lock().await;
+                status_payload.status = status_payload.status & 0b1101_1111; // 下位5bit目を0にする
+            }
 
             // ロギング開始
             b'l' => IS_LOGGING.store(true, Ordering::Relaxed),
@@ -273,37 +282,43 @@ async fn can_transmit_task(mut tx: twai::TwaiTx<'static, Async>) {
         {
             // コマンド処理タスクからの送信依頼が来た場合
             Either::First((can_id, command)) => {
-                let frame = create_can_frame_to_send(can_id, command);
-                // 100msでタイムアウトさせる
-                let result = embassy_time::with_timeout(
-                    Duration::from_millis(100),
-                    tx.transmit_async(&frame),
-                )
-                .await;
-                // if result.is_err() {
-                //     println!("CAN Timeout ID {}", can_id);
-                // }
+                if let Some(frame) = create_can_frame_to_send(can_id, command) {
+                    let result = embassy_time::with_timeout(
+                        Duration::from_millis(100),
+                        tx.transmit_async(&frame),
+                    )
+                    .await;
+                    // if result.is_err() {
+                    //     println!("CAN Timeout ID {}", can_id);
+                    // }
+                } else {
+                    println!("invalid CAN frame: id=0x{:03x}, cmd={}", can_id, command);
+                }
             }
 
             // 60秒経過した場合（
             Either::Second(_) => {
-                let _ = embassy_time::with_timeout(
-                    Duration::from_millis(100),
-                    tx.transmit_async(&create_can_frame_to_send(CAN_ID_TEST_TO_LOG_PARA, 0)),
-                )
-                .await;
+                if let Some(frame) = create_can_frame_to_send(CAN_ID_TEST_TO_LOG_PARA, 0) {
+                    let _ = embassy_time::with_timeout(
+                        Duration::from_millis(100),
+                        tx.transmit_async(&frame),
+                    )
+                    .await;
+                }
 
-                let _ = embassy_time::with_timeout(
-                    Duration::from_millis(100),
-                    tx.transmit_async(&create_can_frame_to_send(CAN_ID_TEST_TO_CAMERA, 0)),
-                )
-                .await;
-
-                let _ = embassy_time::with_timeout(
-                    Duration::from_millis(100),
-                    tx.transmit_async(&create_can_frame_to_send(CAN_ID_TEST_TO_POWER_CONTROL, 0)),
-                )
-                .await;
+                if let Some(frame) = create_can_frame_to_send(CAN_ID_TEST_TO_CAMERA, 0) {
+                    let _ = embassy_time::with_timeout(
+                        Duration::from_millis(100),
+                        tx.transmit_async(&frame),
+                    )
+                    .await;
+                }
+                // if let Some(frame) = create_can_frame_to_send(CAN_ID_TEST_TO_POWER_CONTROL, 0) {
+                //     let _ = embassy_time::with_timeout(
+                //         Duration::from_millis(100),
+                //         tx.transmit_async(&frame),
+                //     )
+                //     .await;
             }
         }
     }
@@ -362,13 +377,16 @@ async fn can_receive_task(mut rx: twai::TwaiRx<'static, Async>) {
                         status_payload.status = (status_payload.status & 0b0111_1111) | 0b1000_0000;
                     }
                     Id::Standard(s_id) if s_id.as_raw() == CAN_ID_CAMERA_STATUS => {
-                        let status = payload.data()[0];
-                        let mut status_payload = PAYLOAD_MUTEX.lock().await;
-
-                        // (*status_payload & 0b1111_1000) -> 上位5bitだけ残して下位3bitを0にする
-                        // (status & 0b0000_0111) -> 受け取ったデータの下位3bitだけ抽出する
-                        status_payload.status =
-                            (status_payload.status & 0b1111_1000) | (status & 0b0000_0111);
+                        if let Some(&status) = payload.data().first() {
+                            let mut status_payload = PAYLOAD_MUTEX.lock().await;
+                            // (*status_payload & 0b1111_1000) -> 上位5bitだけ残して下位3bitを0にする
+                            // (status & 0b0000_0111) -> 受け取ったデータの下位3bitだけ抽出する
+                            status_payload.status =
+                                (status_payload.status & 0b1111_1000) | (status & 0b0000_0111);
+                        }
+                        // else {
+                        //     println!("camera status frame too short");
+                        // }
                     }
                     Id::Standard(s_id) if s_id.as_raw() == CAN_ID_TEST_FROM_LOG_PARA => {
                         let mut status_payload = PAYLOAD_MUTEX.lock().await;
@@ -382,20 +400,20 @@ async fn can_receive_task(mut rx: twai::TwaiRx<'static, Async>) {
                         // 受信時刻を更新
                         *LAST_SEEN_CAMERA.lock().await = Some(Instant::now());
                     }
-                    Id::Standard(s_id) if s_id.as_raw() == CAN_ID_TEST_FROM_POWER_CONTROL => {
-                        let status = payload.data()[0];
-                        let mut status_payload = PAYLOAD_MUTEX.lock().await;
-                        status_payload.status = (status_payload.status & 0b1101_1111) | 0b0010_0000;
-                        // 受信時刻を更新
-                        *LAST_SEEN_POWER.lock().await = Some(Instant::now());
-                    }
+                    // Id::Standard(s_id) if s_id.as_raw() == CAN_ID_TEST_FROM_POWER_CONTROL => {
+                    //     let status = payload.data()[0];
+                    //     let mut status_payload = PAYLOAD_MUTEX.lock().await;
+                    //     status_payload.status = (status_payload.status & 0b1101_1111) | 0b0010_0000;
+                    //     // 受信時刻を更新
+                    //     *LAST_SEEN_POWER.lock().await = Some(Instant::now());
+                    // }
                     _ => {} // ignore the others
                 }
             }
             Err(e) => {
                 // CAN受信エラー時はLEDを点滅させる
                 IS_CAN_ERROR.store(true, Ordering::Relaxed);
-                println!("CAN receive error: {:?}", e);
+                // println!("CAN receive error: {:?}", e);
             }
         }
     }
@@ -426,7 +444,7 @@ async fn lora_task(mut uart: Uart<'static, Async>, mut aux_pin: Input<'static>) 
                 Ok(Either::Second(Err(_))) => {} // UART受信エラー時の処理
                 Err(_) => {}                     //タイムアウト
             }
-            if last_tx.elapsed().as_secs() >= 3 {
+            if last_tx.elapsed().as_millis() >= LORA_TRANSMIT_INTERVAL_MS {
                 // 送信処理
                 let mut payload = Payload::new();
                 {
@@ -476,9 +494,9 @@ async fn create_lora_payload() {
             if is_timeout(*LAST_SEEN_CAMERA.lock().await) {
                 payload.status &= 0b1110_1111; // カメラ基板タイムアウト
             }
-            if is_timeout(*LAST_SEEN_POWER.lock().await) {
-                payload.status &= 0b1101_1111; // 電源基板タイムアウト
-            }
+            // if is_timeout(*LAST_SEEN_POWER.lock().await) {
+            //     payload.status &= 0b1101_1111; // 電源基板タイムアウト
+            // }
 
             payload.check_sum = payload.calculate_checksum();
         }
@@ -501,11 +519,6 @@ pub async fn gnss_manager_task(mut uart: Uart<'static, Async>, mut gnss_en: Outp
                     continue;
                 }
                 for &letter in &read_buf[..bytes_read] {
-                    if let Ok(s) = core::str::from_utf8(&read_buf[..bytes_read]) {
-                        print!("{}", s);
-                    } else {
-                        println!("(Garbage Data: {:?})", &read_buf[..bytes_read]);
-                    }
                     if letter == b'$' {
                         line_len = 0;
                         line_buf[line_len] = letter;
@@ -522,7 +535,6 @@ pub async fn gnss_manager_task(mut uart: Uart<'static, Async>, mut gnss_en: Outp
                             let mut send_buf = [0u8; 90];
                             // line_buf から有効な長さ分だけ、send_bufの先頭にコピーする
                             send_buf[..line_len].copy_from_slice(&line_buf[..line_len]);
-                            println!("raw gnss: {:?}", send_buf);
                             if let Err(_) = GNSS_CHANNEL.try_send(send_buf) {
                                 let _ = GNSS_CHANNEL.try_receive();
                                 let _ = GNSS_CHANNEL.try_send(send_buf);
@@ -862,9 +874,18 @@ async fn main(spawner0: Spawner) -> ! {
         .into_async();
 
     // spawn tasks on core0
-    spawner0.spawn(gnss_manager_task(uart1, gnss_en)).ok();
-    spawner0.spawn(sd_write_task(volume_mgr)).ok();
-    spawner0.spawn(command_process_task()).ok();
+    spawner0
+        .spawn(gnss_manager_task(uart1, gnss_en))
+        .expect("gnss_manager_task should spawn during setup");
+    spawner0
+        .spawn(sd_write_task(volume_mgr))
+        .expect("sd_write_task should spawn during setup");
+    spawner0
+        .spawn(command_process_task())
+        .expect("command_process_task should spawn during setup");
+    spawner0
+        .spawn(create_lora_payload())
+        .expect("create_lora_payload should spawn during setup");
     // spawn tasks on core1
     esp_rtos::start_second_core(
         peripherals.CPU_CTRL,
@@ -910,10 +931,18 @@ async fn main(spawner0: Spawner) -> ! {
                     .with_rx(lora_rx)
                     .with_tx(lora_tx)
                     .into_async();
-                spawner.spawn(can_receive_task(rx)).ok();
-                spawner.spawn(can_transmit_task(tx)).ok();
-                spawner.spawn(parse_gnss_task()).ok();
-                spawner.spawn(lora_task(uart2, aux_pin)).ok();
+                spawner
+                    .spawn(can_receive_task(rx))
+                    .expect("can_receive_task should spawn during setup");
+                spawner
+                    .spawn(can_transmit_task(tx))
+                    .expect("can_transmit_task should spawn during setup");
+                spawner
+                    .spawn(parse_gnss_task())
+                    .expect("parse_gnss_task should spawn during setup");
+                spawner
+                    .spawn(lora_task(uart2, aux_pin))
+                    .expect("lora_task should spawn during setup");
             });
         },
     );
@@ -922,7 +951,7 @@ async fn main(spawner0: Spawner) -> ! {
         let is_can_error = IS_CAN_ERROR.load(Ordering::Relaxed);
 
         if is_can_error {
-            // エラーなら100msごとにON/OFFが反転（点滅）
+            // エラーならON/OFFが反転
             led1.toggle();
         } else {
             // 正常なら消灯したまま
