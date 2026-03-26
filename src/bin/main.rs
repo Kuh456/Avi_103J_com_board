@@ -13,7 +13,6 @@ use core::fmt::Write;
     reason = "it's not unusual to allocate larger buffers etc. in main"
 )]
 use embassy_executor::Spawner;
-use embassy_executor::raw;
 use embassy_futures::select::{Either, Either3, select, select3};
 use embassy_sync::{
     blocking_mutex::raw::CriticalSectionRawMutex, channel::Channel, mutex::Mutex, signal::Signal,
@@ -68,7 +67,7 @@ use esp_hal::{
     system::Stack,
     timer::timg::TimerGroup,
     twai::{self, BaudRate, EspTwaiFrame, StandardId, TwaiMode, filter::SingleStandardFilter},
-    uart::{Config as UartConfig, DataBits, Parity, StopBits, Uart, UartRx},
+    uart::{Config as UartConfig, DataBits, Parity, StopBits, Uart},
 };
 use esp_println::{print, println};
 use esp_rtos::embassy::Executor;
@@ -95,8 +94,8 @@ static GNSS_CMD_CHANNEL: Channel<CriticalSectionRawMutex, GnssCommand, 2> = Chan
 const CAN_ID_EMERGENCY_STOP_PARA: u16 = 0x003;
 const CAN_ID_STOP_SEQUENCE: u16 = 0x00a;
 const CAN_ID_START_SEQUENCE: u16 = 0x005;
-const CAN_ID_ACTUATE_PARA: u16 = 0x00d;
-const CAN_ID_REVERSE_PARA: u16 = 0x00f;
+// const CAN_ID_ACTUATE_PARA: u16 = 0x00d;
+const CAN_ID_ERASE_FLASH: u16 = 0x00f;
 const CAN_ID_STAET_LOGGING: u16 = 0x011;
 const CAN_ID_STOP_LOGGING: u16 = 0x01e;
 const CAN_ID_STAET_RECORDING: u16 = 0x020;
@@ -116,7 +115,7 @@ const CAN_ID_TEST_FROM_CAMERA: u16 = 0x311;
 // const CAN_ID_TEST_TO_POWER_CONTROL: u16 = 0x320;
 // const CAN_ID_TEST_FROM_POWER_CONTROL: u16 = 0x321;
 const BUF_SIZE: usize = 2048;
-const LORA_TRANSMIT_INTERVAL_MS: u64 = 2500;
+const LORA_TRANSMIT_INTERVAL_MS: u64 = 2200;
 
 #[derive(Debug, Copy, Clone)]
 struct Payload {
@@ -223,8 +222,8 @@ const fn get_target_can_id(cmd: u8) -> Option<u16> {
     match cmd {
         b'e' => Some(CAN_ID_STOP_SEQUENCE),
         b's' => Some(CAN_ID_START_SEQUENCE),
-        b'p' => Some(CAN_ID_ACTUATE_PARA),
-        b'r' => Some(CAN_ID_REVERSE_PARA),
+        // b'p' => Some(CAN_ID_ACTUATE_PARA),
+        b'x' => Some(CAN_ID_ERASE_FLASH),
         b'l' => Some(CAN_ID_STAET_LOGGING),
         b'm' => Some(CAN_ID_STOP_LOGGING),
         b'c' => Some(CAN_ID_STAET_RECORDING),
@@ -249,6 +248,7 @@ async fn command_process_task() {
             }
             b'e' => {
                 IS_LOGGING.store(false, Ordering::Relaxed);
+                GNSS_CMD_CHANNEL.send(GnssCommand::TurnOff).await;
                 let mut status_payload = PAYLOAD_MUTEX.lock().await;
                 status_payload.status = status_payload.status & 0b1101_1111; // 下位5bit目を0にする
             }
@@ -288,9 +288,9 @@ async fn can_transmit_task(mut tx: twai::TwaiTx<'static, Async>) {
                         tx.transmit_async(&frame),
                     )
                     .await;
-                    // if result.is_err() {
-                    //     println!("CAN Timeout ID {}", can_id);
-                    // }
+                    if result.is_err() {
+                        IS_CAN_ERROR.store(true, Ordering::Relaxed);
+                    }
                 } else {
                     println!("invalid CAN frame: id=0x{:03x}, cmd={}", can_id, command);
                 }
@@ -299,19 +299,25 @@ async fn can_transmit_task(mut tx: twai::TwaiTx<'static, Async>) {
             // 60秒経過した場合（
             Either::Second(_) => {
                 if let Some(frame) = create_can_frame_to_send(CAN_ID_TEST_TO_LOG_PARA, 0) {
-                    let _ = embassy_time::with_timeout(
+                    let result = embassy_time::with_timeout(
                         Duration::from_millis(100),
                         tx.transmit_async(&frame),
                     )
                     .await;
+                        if result.is_err() {
+                        IS_CAN_ERROR.store(true, Ordering::Relaxed);
+                    }
                 }
 
                 if let Some(frame) = create_can_frame_to_send(CAN_ID_TEST_TO_CAMERA, 0) {
-                    let _ = embassy_time::with_timeout(
+                    let result = embassy_time::with_timeout(
                         Duration::from_millis(100),
                         tx.transmit_async(&frame),
                     )
                     .await;
+                                        if result.is_err() {
+                        IS_CAN_ERROR.store(true, Ordering::Relaxed);
+                    }
                 }
                 // if let Some(frame) = create_can_frame_to_send(CAN_ID_TEST_TO_POWER_CONTROL, 0) {
                 //     let _ = embassy_time::with_timeout(
@@ -333,7 +339,6 @@ async fn can_receive_task(mut rx: twai::TwaiRx<'static, Async>) {
                 IS_CAN_ERROR.store(false, Ordering::Relaxed);
                 match payload.id() {
                     Id::Standard(s_id) if s_id.as_raw() == CAN_ID_LIFT_OFF => {
-                        TRIGGER_SIGNAL.signal(true);
                         let mut status_payload = PAYLOAD_MUTEX.lock().await;
                         status_payload.status = (status_payload.status & 0b1011_1111) | 0b0100_0000;
                     }
@@ -410,7 +415,7 @@ async fn can_receive_task(mut rx: twai::TwaiRx<'static, Async>) {
                     _ => {} // ignore the others
                 }
             }
-            Err(e) => {
+            Err(_e) => {
                 // CAN受信エラー時はLEDを点滅させる
                 IS_CAN_ERROR.store(true, Ordering::Relaxed);
                 // println!("CAN receive error: {:?}", e);
@@ -425,14 +430,14 @@ async fn lora_task(mut uart: Uart<'static, Async>, mut aux_pin: Input<'static>) 
     let mut rx_buf = [0u8; 64];
     let mut last_tx = Instant::now();
     loop {
-        if !is_tx_only_mode {
+        // if !is_tx_only_mode {
             // --- 送受信モード (受信メイン) ---
             let receive_fut = select(TRIGGER_SIGNAL.wait(), uart.read_async(&mut rx_buf));
             match embassy_time::with_timeout(Duration::from_secs(3), receive_fut).await {
                 Ok(Either::First(trigger)) => {
-                    if trigger {
-                        is_tx_only_mode = true;
-                    }
+                    // if trigger {
+                    //     is_tx_only_mode = true;
+                    // }
                 }
                 Ok(Either::Second(Ok(len))) => {
                     // 受信処理
@@ -459,20 +464,20 @@ async fn lora_task(mut uart: Uart<'static, Async>, mut aux_pin: Input<'static>) 
                 aux_pin.wait_for_high().await;
                 last_tx = Instant::now();
             }
-        } else {
-            // 送信専用モード
-            let mut payload = Payload::new();
-            {
-                let payload_guard = PAYLOAD_MUTEX.lock().await;
-                payload = *payload_guard;
-            }
-            let payload_bytes = payload.to_bytes();
-            let _ = uart.write_async(&payload_bytes).await;
-            let _ = uart.flush();
+        // } else {
+        //     // 送信専用モード
+        //     let mut payload = Payload::new();
+        //     {
+        //         let payload_guard = PAYLOAD_MUTEX.lock().await;
+        //         payload = *payload_guard;
+        //     }
+        //     let payload_bytes = payload.to_bytes();
+        //     let _ = uart.write_async(&payload_bytes).await;
+        //     let _ = uart.flush();
 
-            // AUXピンがHIGHになるのを待機（送信完了待ち）
-            aux_pin.wait_for_high().await;
-        }
+        //     // AUXピンがHIGHになるのを待機（送信完了待ち）
+        //     aux_pin.wait_for_high().await;
+        // }
     }
 }
 #[embassy_executor::task]
@@ -483,7 +488,7 @@ async fn create_lora_payload() {
             let now = Instant::now();
             let is_timeout = |last_seen: Option<Instant>| -> bool {
                 match last_seen {
-                    Some(time) => now.duration_since(time).as_secs() > 80,
+                    Some(time) => !(now.duration_since(time).as_secs() < 80),
                     None => true, // まだ1度も受信していない場合も異常（初期状態）とみなす
                 }
             };
@@ -556,7 +561,7 @@ pub async fn gnss_manager_task(mut uart: Uart<'static, Async>, mut gnss_en: Outp
                 }
             }
             Either::First(Err(e)) => {
-                println!("UART receive error{:?}", e);
+                // println!("UART receive error{:?}", e);
             } // UART受信エラー
 
             //  コマンド (ON/OFF) を受信した場合
@@ -604,13 +609,12 @@ async fn parse_gnss_task() {
         match parse_rmc_movement(sentence.as_slice()) {
             Ok(rmc_data) => {
                 if let (Some(speed), Some(degree)) = (rmc_data.speed_kmh, rmc_data.true_course) {
-                    let velocity = [speed, degree];
                     let mut latest = LATEST_RMC.lock().await;
                     *latest = [speed, degree];
                 }
             }
             Err(e) => {
-                println!("parse err:{:?}", e);
+                // println!("parse err:{:?}", e);
                 // パース失敗やrmc以外のセンテンスだった場合の処理
             }
         }
@@ -624,13 +628,12 @@ async fn parse_gnss_task() {
                 }
             }
             Err(e) => {
-                println!("parse err:{:?}", e);
+                // println!("parse err:{:?}", e);
                 // パース失敗やGGA以外のセンテンスだった場合の処理
             }
         }
     }
 }
-
 #[embassy_executor::task]
 async fn sd_write_task(
     mut volume_mgr: &'static mut VolumeManager<
@@ -642,67 +645,82 @@ async fn sd_write_task(
     let mut tlm_buffer = [0u8; BUF_SIZE]; // payload + time stamp
     let mut raw_cursor = 0;
     let mut tlm_cursor = 0;
+
     let mut volume0 = match volume_mgr.open_volume(VolumeIdx(0)) {
         Ok(v) => v,
         Err(e) => {
-            println!("SD Volume Error: {:?}", e);
-            return; // SDカード異常時はタスクを終了
+            esp_println::println!("SD Volume Error: {:?}", e);
+            return;
         }
     };
     let mut root_dir = match volume0.open_root_dir() {
         Ok(d) => d,
         Err(e) => {
-            println!("SD Root Dir Error: {:?}", e);
+            esp_println::println!("SD Root Dir Error: {:?}", e);
             return;
         }
     };
+
     let mut raw_gnss_file = match root_dir.open_file_in_dir(
         "GNSS_RAW.TXT",
         embedded_sdmmc::Mode::ReadWriteCreateOrAppend,
     ) {
         Ok(f) => f,
         Err(e) => {
-            println!("SD File Error (GNSS): {:?}", e);
+            esp_println::println!("SD File Error (GNSS): {:?}", e);
             return;
         }
     };
+    //  既存データを上書きしないよう、末尾に移動
+    let _ = raw_gnss_file.seek_from_end(0);
+
     let mut tlm_file =
         match root_dir.open_file_in_dir("TLM.CSV", embedded_sdmmc::Mode::ReadWriteCreateOrAppend) {
             Ok(f) => f,
             Err(e) => {
-                println!("SD File Error (TLM): {:?}", e);
+                esp_println::println!("SD File Error (TLM): {:?}", e);
                 return;
             }
         };
-    // CSVのヘッダー
+
     if tlm_file.length() == 0 {
-        let header =
-            b"Time_ms,Status,Lat,Long,GyroX,GyroY,GyroZ,AccX,AccY,AccZ,Press1,Press2,Press3,Speed,Course\n";
+        let header = b"Time_ms,Status,Lat,Long,GyroX,GyroY,GyroZ,AccX,AccY,AccZ,Press1,Press2,Press3,Speed,Course\n";
         let _ = tlm_file.write(header);
         let _ = tlm_file.flush();
+    } else {
+        // すでにファイルが存在する場合は末尾へ移動
+        let _ = tlm_file.seek_from_end(0);
     }
+
     let mut last_flush = Instant::now();
     let mut ticker = Ticker::every(Duration::from_millis(500));
     let mut prev_is_logging = false;
+
     loop {
         let is_logging = IS_LOGGING.load(Ordering::Relaxed);
-        if is_logging && !prev_is_logging {
-        } else if !is_logging && prev_is_logging {
+
+        // ロギング終了時の確実なフラッシュ処理
+        if !is_logging && prev_is_logging {
             if raw_cursor > 0 {
-                let _ = raw_gnss_file.write(&raw_buffer[..raw_cursor]);
-                raw_cursor = 0;
+                //  成功した時のみカーソルをリセット
+                if let Ok(_) = raw_gnss_file.write(&raw_buffer[..raw_cursor]) {
+                    raw_cursor = 0;
+                }
             }
             if tlm_cursor > 0 {
-                let _ = tlm_file.write(&tlm_buffer[..tlm_cursor]);
-                tlm_cursor = 0;
+                if let Ok(_) = tlm_file.write(&tlm_buffer[..tlm_cursor]) {
+                    tlm_cursor = 0;
+                }
             }
             let _ = raw_gnss_file.flush();
             let _ = tlm_file.flush();
-            println!("SDカードへの書き込み完了");
+            esp_println::println!("SDカードへの書き込み完了 (ロギング停止)");
         }
         prev_is_logging = is_logging;
+
         let has_data = raw_cursor > 0 || tlm_cursor > 0;
         HAS_UNFLUSHED_DATA.store(has_data, Ordering::Relaxed);
+
         match select(RAW_GNSS_CHANNEL.receive(), ticker.next()).await {
             Either::First(raw_gnss_data) => {
                 if is_logging {
@@ -712,14 +730,23 @@ async fn sd_write_task(
                         .unwrap_or(raw_gnss_data.len());
                     let valid_bytes = &raw_gnss_data[..valid_len];
 
-                    if raw_cursor + valid_bytes.len() > BUF_SIZE {
-                        let _ = raw_gnss_file.write(&raw_buffer[..raw_cursor]);
-                        let _ = raw_gnss_file.flush();
-                        raw_cursor = 0;
+                    if valid_bytes.is_empty() {
+                        continue;
                     }
-                    raw_buffer[raw_cursor..raw_cursor + valid_bytes.len()]
-                        .copy_from_slice(valid_bytes);
-                    raw_cursor += valid_bytes.len();
+
+                    if raw_cursor + valid_bytes.len() > BUF_SIZE {
+                        if let Ok(_) = raw_gnss_file.write(&raw_buffer[..raw_cursor]) {
+                            let _ = raw_gnss_file.flush();
+                            raw_cursor = 0;
+                        }
+                    }
+
+                    // バッファに収まる場合のみコピー
+                    if raw_cursor + valid_bytes.len() <= BUF_SIZE {
+                        raw_buffer[raw_cursor..raw_cursor + valid_bytes.len()]
+                            .copy_from_slice(valid_bytes);
+                        raw_cursor += valid_bytes.len();
+                    }
                 }
             }
             Either::Second(_) => {
@@ -739,8 +766,8 @@ async fn sd_write_task(
                     let press1 = payload.air_pressure[0];
                     let press2 = payload.air_pressure[1];
                     let press3 = payload.air_pressure[2];
-                    let [speed, course] = { *LATEST_RMC.lock().await };
-                    // CSV形式の文字列を組み立てる
+                    let [speed, course] = { *LATEST_RMC.lock().await }; // LATEST_RMC から取得
+
                     let mut csv_line: String<256> = String::new();
                     let _ = write!(
                         &mut csv_line,
@@ -764,13 +791,18 @@ async fn sd_write_task(
 
                     let line_bytes = csv_line.as_bytes();
                     if tlm_cursor + line_bytes.len() > BUF_SIZE {
-                        let _ = tlm_file.write(&tlm_buffer[..tlm_cursor]);
-                        let _ = tlm_file.flush();
-                        tlm_cursor = 0;
+                        if let Ok(_) = tlm_file.write(&tlm_buffer[..tlm_cursor]) {
+                            let _ = tlm_file.flush();
+                            tlm_cursor = 0;
+                        }
                     }
-                    tlm_buffer[tlm_cursor..tlm_cursor + line_bytes.len()]
-                        .copy_from_slice(line_bytes);
-                    tlm_cursor += line_bytes.len();
+
+                    // バッファに収まる場合のみコピー
+                    if tlm_cursor + line_bytes.len() <= BUF_SIZE {
+                        tlm_buffer[tlm_cursor..tlm_cursor + line_bytes.len()]
+                            .copy_from_slice(line_bytes);
+                        tlm_cursor += line_bytes.len();
+                    }
                 }
             }
         }
@@ -778,20 +810,22 @@ async fn sd_write_task(
         // 5秒ごとに強制的に書き込み
         if last_flush.elapsed().as_secs() >= 5 {
             if raw_cursor > 0 {
-                let _ = raw_gnss_file.write(&raw_buffer[..raw_cursor]);
-                let _ = raw_gnss_file.flush();
-                raw_cursor = 0;
+                if let Ok(_) = raw_gnss_file.write(&raw_buffer[..raw_cursor]) {
+                    let _ = raw_gnss_file.flush();
+                    raw_cursor = 0;
+                }
             }
             if tlm_cursor > 0 {
+                //  成功した時のみカーソルをリセットし、エラー時はデータを保持する
                 match tlm_file.write(&tlm_buffer[..tlm_cursor]) {
-                    Ok(size) => println!("TLMCSV: 定期フラッシュ成功 ({:?} bytes)", size),
-                    Err(e) => println!("TLM CSV: 定期フラッシュ失敗 {:?}", e),
+                    Ok(size) => {
+                        esp_println::println!("TLMCSV: 定期フラッシュ成功 ({:?} bytes)", size);
+                        let _ = tlm_file.flush();
+                        tlm_cursor = 0; // 成功した時だけバッファを空にする
+                    }
+                    Err(e) => esp_println::println!("TLM CSV: 定期フラッシュ失敗 {:?}", e),
                 }
-                // let _ = tlm_file.write(&tlm_buffer[..tlm_cursor]);
-                let _ = tlm_file.flush();
-                tlm_cursor = 0;
             }
-            // フラッシュが完了したら、基準時刻を現在時刻にリセット
             last_flush = Instant::now();
         }
     }
@@ -824,37 +858,37 @@ async fn main(spawner0: Spawner) -> ! {
     let lora_rx = Input::new(peripherals.GPIO12, InputConfig::default());
     let gnss_rx = Input::new(peripherals.GPIO21, InputConfig::default());
 
-    // --- SPI ---
-    let spi_bus = Spi::new(
-        peripherals.SPI2,
-        spi::master::Config::default()
-            .with_frequency(Rate::from_khz(400))
-            .with_mode(spi::Mode::_0),
-    )
-    .unwrap()
-    .with_sck(peripherals.GPIO41)
-    .with_mosi(peripherals.GPIO42)
-    .with_miso(peripherals.GPIO40)
-    .into_async();
-    // init sd
-    let sd_cs = Output::new(peripherals.GPIO2, Level::High, OutputConfig::default());
-    let spi_dev = ExclusiveDevice::new(spi_bus, sd_cs, Delay).unwrap();
-    let rtc = Rtc::new(peripherals.LPWR);
-    let sd_timer = SdTimeSource::new(rtc);
-    let sdcard = SdCard::new(spi_dev, Delay);
-    if let Ok(sd_size) = sdcard.num_bytes() {
-        println!("SD Card Size: {} bytes", sd_size);
-    } else {
-        println!("Failed to get SD Card size.");
-    }
-    // To do this we need a Volume Manager. It will take ownership of the block device.
-    static VOLUME_MGR: StaticCell<
-        VolumeManager<
-            SdCard<ExclusiveDevice<Spi<'static, Async>, Output<'static>, Delay>, Delay>,
-            SdTimeSource,
-        >,
-    > = StaticCell::new();
-    let volume_mgr = VOLUME_MGR.init(VolumeManager::new(sdcard, sd_timer));
+    // // --- SPI ---
+    // let spi_bus = Spi::new(
+    //     peripherals.SPI2,
+    //     spi::master::Config::default()
+    //         .with_frequency(Rate::from_khz(400))
+    //         .with_mode(spi::Mode::_0),
+    // )
+    // .unwrap()
+    // .with_sck(peripherals.GPIO41)
+    // .with_mosi(peripherals.GPIO42)
+    // .with_miso(peripherals.GPIO40)
+    // .into_async();
+    // // init sd
+    // let sd_cs = Output::new(peripherals.GPIO2, Level::High, OutputConfig::default());
+    // let spi_dev = ExclusiveDevice::new(spi_bus, sd_cs, Delay).unwrap();
+    // let rtc = Rtc::new(peripherals.LPWR);
+    // let sd_timer = SdTimeSource::new(rtc);
+    // let sdcard = SdCard::new(spi_dev, Delay);
+    // if let Ok(sd_size) = sdcard.num_bytes() {
+    //     println!("SD Card Size: {} bytes", sd_size);
+    // } else {
+    //     println!("Failed to get SD Card size.");
+    // }
+    // // To do this we need a Volume Manager. It will take ownership of the block device.
+    // static VOLUME_MGR: StaticCell<
+    //     VolumeManager<
+    //         SdCard<ExclusiveDevice<Spi<'static, Async>, Output<'static>, Delay>, Delay>,
+    //         SdTimeSource,
+    //     >,
+    // > = StaticCell::new();
+    // let volume_mgr = VOLUME_MGR.init(VolumeManager::new(sdcard, sd_timer));
     // Try and access Volume 0 (i.e. the first partition).
     // The volume object holds information about the filesystem on that volume.
     m0.set_low();
@@ -877,9 +911,9 @@ async fn main(spawner0: Spawner) -> ! {
     spawner0
         .spawn(gnss_manager_task(uart1, gnss_en))
         .expect("gnss_manager_task should spawn during setup");
-    spawner0
-        .spawn(sd_write_task(volume_mgr))
-        .expect("sd_write_task should spawn during setup");
+    // spawner0
+    //     .spawn(sd_write_task(volume_mgr))
+    //     .expect("sd_write_task should spawn during setup");
     spawner0
         .spawn(command_process_task())
         .expect("command_process_task should spawn during setup");
@@ -957,14 +991,14 @@ async fn main(spawner0: Spawner) -> ! {
             // 正常なら消灯したまま
             led1.set_low();
         }
-        let is_logging = IS_LOGGING.load(Ordering::Relaxed);
-        let has_unflushed = HAS_UNFLUSHED_DATA.load(Ordering::Relaxed);
+        // let is_logging = IS_LOGGING.load(Ordering::Relaxed);
+        // let has_unflushed = HAS_UNFLUSHED_DATA.load(Ordering::Relaxed);
 
-        if is_logging || has_unflushed {
-            led2.set_high(); // ロギング中 or 保存待ちデータがあれば点灯
-        } else {
-            led2.set_low(); // 完全に保存が終わっていれば消灯
-        }
+        // if is_logging || has_unflushed {
+        //     led2.set_high(); // ロギング中 or 保存待ちデータがあれば点灯
+        // } else {
+        //     led2.set_low(); // 完全に保存が終わっていれば消灯
+        // }
         Timer::after(Duration::from_millis(100)).await;
     }
 }
